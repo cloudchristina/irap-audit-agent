@@ -1,0 +1,11 @@
+.superpowers/
+infra/terraform.tfvars
+infra/terraform.tfstate
+infra/terraform.tfstate.backup
+infra/plan.tfplan
+infra/.infra/
+infra/layer_builds/
+infra/builds/
+__pycache__/
+*.pyc
+infra/.terraform/

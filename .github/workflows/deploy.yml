@@ -1,0 +1,76 @@
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  id-token: write   # required for OIDC token request
+  contents: read
+
+jobs:
+  test-extractor:
+    name: Test extractor Lambda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pytest -r src/extractor/requirements.txt
+      - run: python -m pytest test_handler.py -v
+        working-directory: src/extractor
+
+  test-assessor:
+    name: Test assessor Lambda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pytest -r src/assessor/requirements.txt
+      - run: python -m pytest test_tools.py test_handler.py -v
+        working-directory: src/assessor
+
+  deploy:
+    name: Terraform apply
+    needs: [test-extractor, test-assessor]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ap-southeast-2
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build Lambda layers
+        run: |
+          mkdir -p infra/layer_builds/extractor/python infra/layer_builds/assessor/python
+          pip install -r src/extractor/requirements.txt \
+            -t infra/layer_builds/extractor/python \
+            --platform manylinux2014_x86_64 --only-binary=:all: --quiet
+          pip install -r src/assessor/requirements.txt \
+            -t infra/layer_builds/assessor/python \
+            --platform manylinux2014_x86_64 --only-binary=:all: --quiet
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.14"
+
+      - name: Terraform init
+        run: terraform init
+        working-directory: infra
+
+      - name: Terraform apply
+        run: terraform apply -auto-approve
+        working-directory: infra
+        env:
+          TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}

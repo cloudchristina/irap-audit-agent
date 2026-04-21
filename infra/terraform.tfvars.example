@@ -1,0 +1,8 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit real values.
+
+# Email address for SNS compliance alert notifications
+alert_email = "your-email@example.com"
+
+# Optional: override the RDS master username (default: irap_admin)
+# rds_username = "irap_admin"

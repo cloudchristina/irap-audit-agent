@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+
+jobs:
+  test-extractor:
+    name: Test extractor Lambda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pytest -r src/extractor/requirements.txt
+      - run: python -m pytest test_handler.py -v
+        working-directory: src/extractor
+
+  test-assessor:
+    name: Test assessor Lambda
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pytest -r src/assessor/requirements.txt
+      - run: python -m pytest test_tools.py test_handler.py -v
+        working-directory: src/assessor
+
+  terraform-validate:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "~1.14"
+      - name: Init (no backend)
+        run: terraform init -backend=false
+        working-directory: infra
+      - name: Validate
+        run: terraform validate
+        working-directory: infra
