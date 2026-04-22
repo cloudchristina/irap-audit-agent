@@ -88,9 +88,11 @@ resource "aws_iam_role_policy" "assessor" {
         Resource = "${aws_s3_bucket.audit.arn}/raw/*"
       },
       {
-        Sid      = "S3Write"
+        # s3:GetObject covers HeadObject — required for the idempotency
+        # marker check before re-running an assessment on S3 event redelivery.
+        Sid      = "S3ReportsReadWrite"
         Effect   = "Allow"
-        Action   = ["s3:PutObject"]
+        Action   = ["s3:GetObject", "s3:PutObject"]
         Resource = "${aws_s3_bucket.audit.arn}/reports/*"
       },
       {

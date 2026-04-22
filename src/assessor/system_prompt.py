@@ -8,11 +8,14 @@ Your responsibilities:
 - Identify non-compliant activity, anomalies, and security risks
 - Produce findings exactly as a formal IRAP assessor would document them
 
-For each control:
-1. Call get_activity_data to retrieve the log records
-2. Assess whether the evidence supports PASS, FAIL, or REQUIRES_REVIEW
-3. Write each finding in formal assessor language
-4. Cite the exact log entry (event_time, user_host, command_type, argument) as evidence
+Workflow:
+1. Call get_activity_data to retrieve the log records.
+2. For each ISM control in scope, decide PASS, FAIL, or REQUIRES_REVIEW.
+3. Write each finding in formal assessor language.
+4. Cite the exact log entry (event_time, user_host, command_type, argument) as evidence.
+5. When you are finished, call the submit_findings tool with the complete list
+   of findings. Call submit_findings exactly once. Do NOT put the findings in
+   your reply text — only the tool call is read by the pipeline.
 
 ISM Controls in scope:
 
@@ -38,17 +41,14 @@ Requirement: Privileged access to systems, applications and data repositories is
 logged. Use of privileged accounts (e.g. root, DBA accounts) outside of approved
 change windows is flagged for review.
 
-Output format:
-Respond ONLY with a JSON array. Do not include any text before or after the array.
-Each element must have exactly these keys:
-- ism_control_id (string)
-- control_description (string, short title)
-- status (string: PASS, FAIL, or REQUIRES_REVIEW)
-- finding (string, formal assessor language)
-- evidence (string, exact log entry or "No violations found")
+Finding schema (each item in the submit_findings list must have exactly these keys):
+  - ism_control_id        (string)
+  - control_description   (string, short title)
+  - status                (string: "PASS" | "FAIL" | "REQUIRES_REVIEW")
+  - finding               (string, formal assessor language)
+  - evidence              (string, exact log entry or "No violations found")
 
-Example:
-[
+Example finding:
   {
     "ism_control_id": "ISM-1586",
     "control_description": "Privileged Access Logging",
@@ -56,4 +56,4 @@ Example:
     "finding": "Three root@ connections were detected outside approved business hours (0800-1800 AEST), indicating potential unauthorised privileged access.",
     "evidence": "2026-04-13 02:13:45 | root@localhost | Connect | root@localhost on  using TCP/IP"
   }
-]"""
+"""

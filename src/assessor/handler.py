@@ -3,16 +3,17 @@ import io
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 
 import boto3
+from botocore.exceptions import ClientError
 from strands import Agent
+
 from strands.models import BedrockModel
 
 from callback import trace_callback
 from system_prompt import SYSTEM_PROMPT
-from tools import make_get_activity_data
+from tools import make_get_activity_data, make_submit_findings
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -32,9 +33,14 @@ def _require_env(name: str) -> str:
     return value
 
 
-def parse_s3_event(event: dict) -> tuple[str, str]:
+def parse_s3_event(event: dict) -> tuple[str, str, str | None]:
+    """Return (bucket, key, version_id). version_id is None if versioning is off."""
     record = event["Records"][0]["s3"]
-    return record["bucket"]["name"], record["object"]["key"]
+    return (
+        record["bucket"]["name"],
+        record["object"]["key"],
+        record["object"].get("versionId"),
+    )
 
 
 def extract_report_date(key: str) -> str:
@@ -43,33 +49,59 @@ def extract_report_date(key: str) -> str:
     return parts[1] if len(parts) >= 2 else datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def marker_key(report_date: str, source_version_id: str | None) -> str:
+    """Per-source-version idempotency marker written to S3 on successful processing.
+
+    Keying on the source object's ``versionId`` means:
+      - S3 re-delivering the same event → marker exists → skip
+      - A genuinely new extract (new versionId under the same key) → no marker → process
+    """
+    vid = source_version_id or "noversion"
+    return f"reports/{report_date}/.processed-{vid}"
+
+
+def already_processed(bucket: str, marker: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=marker)
+        return True
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
+def write_marker(bucket: str, marker: str) -> None:
+    s3.put_object(Bucket=bucket, Key=marker, Body=b"", ContentType="text/plain")
+
+
 def run_assessment(bucket: str, key: str, report_date: str) -> list[dict]:
     get_activity_data = make_get_activity_data(bucket, key)
+    submit_findings, sink = make_submit_findings()
 
     model = BedrockModel(model_id=MODEL_ID, region_name=os.environ.get("AWS_REGION", "ap-southeast-2"))
     agent = Agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
-        tools=[get_activity_data],
+        tools=[get_activity_data, submit_findings],
         callback_handler=trace_callback,
     )
 
-    task = f"Review the database activity log for the week ending {report_date}. Use get_activity_data to load the records, then produce your compliance assessment."
-    response = agent(task)
+    task = (
+        f"Review the database activity log for the week ending {report_date}. "
+        "Call get_activity_data to load the records, assess each ISM control in scope, "
+        "then call submit_findings exactly once with the complete list of findings."
+    )
+    agent(task)
 
-    raw_text = str(response)
-
-    # Strip markdown code fences if the model wrapped the JSON
-    json_text = raw_text.strip()
-    match = re.search(r"```(?:json)?\s*([\s\S]+?)```", json_text)
-    if match:
-        json_text = match.group(1).strip()
-
-    try:
-        findings = json.loads(json_text)
-    except json.JSONDecodeError as e:
-        logger.error(json.dumps({"event": "parse_error", "error": str(e), "raw_text_preview": raw_text[:200]}, default=str))
-        raise ValueError(f"Agent returned non-JSON response: {e}") from e
+    findings = sink["findings"]
+    if findings is None:
+        logger.error(json.dumps({
+            "event": "no_findings_submitted",
+            "bucket": bucket,
+            "key": key,
+        }))
+        raise ValueError("Agent completed without calling submit_findings")
     return findings
 
 
@@ -108,17 +140,50 @@ def handler(event, context):
     audit_bucket = _require_env("AUDIT_BUCKET")
     sns_topic_arn = _require_env("SNS_TOPIC_ARN")
 
-    bucket, key = parse_s3_event(event)
+    bucket, key, version_id = parse_s3_event(event)
     if bucket != audit_bucket:
         raise ValueError(f"Event bucket {bucket!r} does not match AUDIT_BUCKET {audit_bucket!r}")
     report_date = extract_report_date(key)
+    marker = marker_key(report_date, version_id)
 
-    logger.info(json.dumps({"event": "assessment_start", "bucket": bucket, "key": key, "report_date": report_date}, default=str))
+    logger.info(json.dumps({
+        "event": "assessment_start",
+        "bucket": bucket,
+        "key": key,
+        "version_id": version_id,
+        "report_date": report_date,
+    }, default=str))
+
+    # Idempotency: if we've already processed this specific source version,
+    # skip the full run (and the SNS email) on re-delivery.
+    if already_processed(audit_bucket, marker):
+        logger.info(json.dumps({
+            "event": "idempotent_skip",
+            "marker": marker,
+            "report_date": report_date,
+        }))
+        return {"statusCode": 200, "skipped": True, "marker": marker}
+
+    # Write the marker before invoking Bedrock so that a crash between
+    # write_report/notify and the final put_object cannot cause a duplicate
+    # SNS alert on re-delivery. A phantom marker (Bedrock call failed after
+    # this point) is recoverable by manual deletion; a duplicate alert is not.
+    write_marker(audit_bucket, marker)
 
     findings = run_assessment(bucket, key, report_date)
     report_key = write_report(findings, report_date, bucket=audit_bucket)
     notify(report_key, findings, report_date, bucket=audit_bucket, sns_topic_arn=sns_topic_arn)
 
-    logger.info(json.dumps({"event": "assessment_complete", "report_key": report_key, "findings_count": len(findings)}, default=str))
+    logger.info(json.dumps({
+        "event": "assessment_complete",
+        "report_key": report_key,
+        "findings_count": len(findings),
+        "marker": marker,
+    }, default=str))
 
-    return {"statusCode": 200, "report_key": report_key, "findings_count": len(findings)}
+    return {
+        "statusCode": 200,
+        "report_key": report_key,
+        "findings_count": len(findings),
+        "marker": marker,
+    }

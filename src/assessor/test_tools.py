@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock, call, patch
 
-from tools import make_get_activity_data
+from tools import make_get_activity_data, make_submit_findings
 
 
 def test_make_get_activity_data_returns_rows():
@@ -38,3 +38,40 @@ def test_make_get_activity_data_closes_over_key():
     calls = mock_s3.get_object.call_args_list
     assert calls[0] == call(Bucket="bucket", Key="raw/2026-04-07/user-activity.csv")
     assert calls[1] == call(Bucket="bucket", Key="raw/2026-04-14/user-activity.csv")
+
+
+# ── submit_findings: structured output replaces regex JSON parsing ───────────
+
+def _underlying(tool_fn):
+    """Strands @tool wraps the callable. Unwrap to the original function for direct tests."""
+    # Strands exposes the decorated function under several attribute names across
+    # versions; probe the common ones and fall back to calling the wrapper's invoke.
+    for attr in ("func", "_func", "fn", "_fn", "__wrapped__"):
+        inner = getattr(tool_fn, attr, None)
+        if callable(inner):
+            return inner
+    return tool_fn
+
+
+def test_submit_findings_captures_payload_into_sink():
+    tool_fn, sink = make_submit_findings()
+    findings = [
+        {"ism_control_id": "ISM-1586", "control_description": "Privileged Access Logging",
+         "status": "FAIL", "finding": "Root login outside hours", "evidence": "..."},
+    ]
+    assert sink["findings"] is None
+
+    _underlying(tool_fn)(findings)
+
+    assert sink["findings"] == findings
+
+
+def test_submit_findings_factories_are_isolated():
+    """Each factory call returns an independent sink — Lambda container reuse must not leak state."""
+    tool_a, sink_a = make_submit_findings()
+    tool_b, sink_b = make_submit_findings()
+
+    _underlying(tool_a)([{"ism_control_id": "ISM-0109"}])
+
+    assert sink_a["findings"] == [{"ism_control_id": "ISM-0109"}]
+    assert sink_b["findings"] is None
