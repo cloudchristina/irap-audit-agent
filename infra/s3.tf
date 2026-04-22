@@ -59,9 +59,16 @@ resource "aws_s3_bucket_policy" "audit" {
         Resource  = [aws_s3_bucket.audit.arn, "${aws_s3_bucket.audit.arn}/*"]
         Condition = {
           StringNotLike = {
+            # Include both the IAM role ARN (arn:aws:iam::...:role/...) and the
+            # STS assumed-role session ARN (arn:aws:sts::...:assumed-role/.../*).
+            # aws:PrincipalArn in S3 bucket policies resolves to the session ARN
+            # for Lambda (and other STS callers), not the IAM role ARN, so both
+            # forms are required for the exclusion to take effect.
             "aws:PrincipalArn" = [
               aws_iam_role.extractor.arn,
+              "arn:aws:sts::${data.aws_caller_identity.current.account_id}:assumed-role/${aws_iam_role.extractor.name}/*",
               aws_iam_role.assessor.arn,
+              "arn:aws:sts::${data.aws_caller_identity.current.account_id}:assumed-role/${aws_iam_role.assessor.name}/*",
               "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
               "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/*",
               "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.ci_role_name}",

@@ -6,7 +6,6 @@ import os
 from datetime import datetime, timezone
 
 import boto3
-from botocore.exceptions import ClientError
 from strands import Agent
 
 from strands.models import BedrockModel
@@ -33,46 +32,15 @@ def _require_env(name: str) -> str:
     return value
 
 
-def parse_s3_event(event: dict) -> tuple[str, str, str | None]:
-    """Return (bucket, key, version_id). version_id is None if versioning is off."""
+def parse_s3_event(event: dict) -> tuple[str, str]:
     record = event["Records"][0]["s3"]
-    return (
-        record["bucket"]["name"],
-        record["object"]["key"],
-        record["object"].get("versionId"),
-    )
+    return record["bucket"]["name"], record["object"]["key"]
 
 
 def extract_report_date(key: str) -> str:
     # key format: raw/YYYY-MM-DD/user-activity.csv
     parts = key.split("/")
     return parts[1] if len(parts) >= 2 else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def marker_key(report_date: str, source_version_id: str | None) -> str:
-    """Per-source-version idempotency marker written to S3 on successful processing.
-
-    Keying on the source object's ``versionId`` means:
-      - S3 re-delivering the same event → marker exists → skip
-      - A genuinely new extract (new versionId under the same key) → no marker → process
-    """
-    vid = source_version_id or "noversion"
-    return f"reports/{report_date}/.processed-{vid}"
-
-
-def already_processed(bucket: str, marker: str) -> bool:
-    try:
-        s3.head_object(Bucket=bucket, Key=marker)
-        return True
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey", "NotFound"):
-            return False
-        raise
-
-
-def write_marker(bucket: str, marker: str) -> None:
-    s3.put_object(Bucket=bucket, Key=marker, Body=b"", ContentType="text/plain")
 
 
 def run_assessment(bucket: str, key: str, report_date: str) -> list[dict]:
@@ -140,35 +108,17 @@ def handler(event, context):
     audit_bucket = _require_env("AUDIT_BUCKET")
     sns_topic_arn = _require_env("SNS_TOPIC_ARN")
 
-    bucket, key, version_id = parse_s3_event(event)
+    bucket, key = parse_s3_event(event)
     if bucket != audit_bucket:
         raise ValueError(f"Event bucket {bucket!r} does not match AUDIT_BUCKET {audit_bucket!r}")
     report_date = extract_report_date(key)
-    marker = marker_key(report_date, version_id)
 
     logger.info(json.dumps({
         "event": "assessment_start",
         "bucket": bucket,
         "key": key,
-        "version_id": version_id,
         "report_date": report_date,
     }, default=str))
-
-    # Idempotency: if we've already processed this specific source version,
-    # skip the full run (and the SNS email) on re-delivery.
-    if already_processed(audit_bucket, marker):
-        logger.info(json.dumps({
-            "event": "idempotent_skip",
-            "marker": marker,
-            "report_date": report_date,
-        }))
-        return {"statusCode": 200, "skipped": True, "marker": marker}
-
-    # Write the marker before invoking Bedrock so that a crash between
-    # write_report/notify and the final put_object cannot cause a duplicate
-    # SNS alert on re-delivery. A phantom marker (Bedrock call failed after
-    # this point) is recoverable by manual deletion; a duplicate alert is not.
-    write_marker(audit_bucket, marker)
 
     findings = run_assessment(bucket, key, report_date)
     report_key = write_report(findings, report_date, bucket=audit_bucket)
@@ -178,12 +128,10 @@ def handler(event, context):
         "event": "assessment_complete",
         "report_key": report_key,
         "findings_count": len(findings),
-        "marker": marker,
     }, default=str))
 
     return {
         "statusCode": 200,
         "report_key": report_key,
         "findings_count": len(findings),
-        "marker": marker,
     }
